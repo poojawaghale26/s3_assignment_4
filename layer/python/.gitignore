@@ -1,0 +1,6 @@
+.aws-sam/
+__pycache__/
+*.pyc
+.vscode/
+.env
+template-generated.yaml

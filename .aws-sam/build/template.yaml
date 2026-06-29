@@ -1,0 +1,376 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Customer Transaction Serverless Application
+Parameters:
+  DBUsername:
+    Type: String
+    Default: admin
+  CodeBucket:
+    Type: String
+    Default: customer-rds-code-bucket-ap-south-1
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: CustomerVPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        Ref: VPC
+      InternetGatewayId:
+        Ref: InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPC
+      AvailabilityZone:
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: ''
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: PublicSubnet
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPC
+      AvailabilityZone:
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: ''
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+      - Key: Name
+        Value: PrivateSubnet1
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPC
+      AvailabilityZone:
+        Fn::Select:
+        - 1
+        - Fn::GetAZs: ''
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+      - Key: Name
+        Value: PrivateSubnet2
+  NatElasticIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+        - NatElasticIP
+        - AllocationId
+      SubnetId:
+        Ref: PublicSubnet
+      Tags:
+      - Key: Name
+        Value: CustomerNatGateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId:
+        Ref: InternetGateway
+  PublicSubnetAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: PublicRouteTable
+      SubnetId:
+        Ref: PublicSubnet
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: VPC
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId:
+        Ref: NatGateway
+  PrivateSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
+      SubnetId:
+        Ref: PrivateSubnet1
+  PrivateSubnet2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
+      SubnetId:
+        Ref: PrivateSubnet2
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Lambda Function
+      VpcId:
+        Ref: VPC
+      SecurityGroupEgress:
+      - IpProtocol: '-1'
+        CidrIp: '0.0.0.0/0'
+      Tags:
+      - Key: Name
+        Value: LambdaSecurityGroup
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for RDS MySQL
+      VpcId:
+        Ref: VPC
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 3306
+        ToPort: 3306
+        SourceSecurityGroupId:
+          Ref: LambdaSecurityGroup
+      Tags:
+      - Key: Name
+        Value: RDSSecurityGroup
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: customer-db-secret
+      Description: Credentials for Customer MySQL Database
+      GenerateSecretString:
+        SecretStringTemplate:
+          Fn::Sub: '{"username":"${DBUsername}"}
+
+            '
+        GenerateStringKey: password
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Customer Database Subnet Group
+      SubnetIds:
+      - Ref: PrivateSubnet1
+      - Ref: PrivateSubnet2
+  CustomerDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: customer-db
+      Engine: mysql
+      EngineVersion: '8.0'
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 20
+      StorageType: gp2
+      PubliclyAccessible: false
+      MultiAZ: false
+      DBName: customerdb
+      MasterUsername:
+        Fn::Sub: '{{resolve:secretsmanager:${DBSecret}:SecretString:username}}'
+      MasterUserPassword:
+        Fn::Sub: '{{resolve:secretsmanager:${DBSecret}:SecretString:password}}'
+      VPCSecurityGroups:
+      - Ref: RDSSecurityGroup
+      DBSubnetGroupName:
+        Ref: DBSubnetGroup
+      BackupRetentionPeriod: 7
+      StorageEncrypted: true
+      DeletionProtection: false
+  MysqlLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: mysql-layer
+      Description: MySQL Connector Layer
+      ContentUri: ..\..\layer
+      CompatibleRuntimes:
+      - python3.12
+      RetentionPolicy: Retain
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: customer-authorizer
+      Runtime: python3.12
+      Handler: authorizer.lambda_handler
+      CodeUri: AuthorizerFunction
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          AUTH_TOKEN: my-secret-token
+      Policies:
+      - AWSLambdaBasicExecutionRole
+    Metadata:
+      SamResourceId: AuthorizerFunction
+  CustomerAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: CustomerAPI
+      StageName: prod
+      Cors:
+        AllowOrigin: '''*'''
+        AllowMethods: '''GET,OPTIONS'''
+        AllowHeaders: '''content-type,customer_id,auth-token'''
+      Auth:
+        DefaultAuthorizer: LambdaAuthorizer
+        Authorizers:
+          LambdaAuthorizer:
+            FunctionArn:
+              Fn::GetAtt:
+              - AuthorizerFunction
+              - Arn
+            Identity:
+              Header: auth-token
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: customer-query
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      CodeUri: QueryFunction
+      Timeout: 30
+      MemorySize: 256
+      Layers:
+      - Ref: MysqlLayer
+      Environment:
+        Variables:
+          SECRET_NAME: customer-db-secret
+          DATABASE_NAME: customerdb
+      VpcConfig:
+        SecurityGroupIds:
+        - Ref: LambdaSecurityGroup
+        SubnetIds:
+        - Ref: PrivateSubnet1
+        - Ref: PrivateSubnet2
+      Policies:
+      - AWSLambdaVPCAccessExecutionRole
+      - AWSLambdaBasicExecutionRole
+      - Statement:
+        - Effect: Allow
+          Action:
+          - secretsmanager:GetSecretValue
+          Resource:
+            Ref: DBSecret
+      Events:
+        CustomerDetails:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: CustomerAPI
+            Path: /details
+            Method: get
+    Metadata:
+      SamResourceId: QueryFunction
+  AuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: AuthorizerFunction
+      Principal: apigateway.amazonaws.com
+  QueryPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName:
+        Ref: QueryFunction
+      Principal: apigateway.amazonaws.com
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        Fn::Sub: ${AWS::StackName}-website-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      OwnershipControls:
+        Rules:
+        - ObjectOwnership: BucketOwnerPreferred
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: PublicRead
+          Effect: Allow
+          Principal: '*'
+          Action:
+          - s3:GetObject
+          Resource:
+            Fn::Sub: ${WebsiteBucket.Arn}/*
+Outputs:
+  ApiURL:
+    Description: Customer Details API
+    Value:
+      Fn::Sub: https://${CustomerAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/details
+  WebsiteURL:
+    Description: Static Website URL
+    Value:
+      Fn::GetAtt:
+      - WebsiteBucket
+      - WebsiteURL
+  SecretArn:
+    Description: Secrets Manager Secret ARN
+    Value:
+      Ref: DBSecret
+  DatabaseEndpoint:
+    Description: MySQL Endpoint
+    Value:
+      Fn::GetAtt:
+      - CustomerDatabase
+      - Endpoint.Address
+  DatabasePort:
+    Description: MySQL Port
+    Value:
+      Fn::GetAtt:
+      - CustomerDatabase
+      - Endpoint.Port
+  LambdaFunction:
+    Description: Query Lambda
+    Value:
+      Ref: QueryFunction
+  AuthorizerFunction:
+    Description: Lambda Authorizer
+    Value:
+      Ref: AuthorizerFunction
+  WebsiteBucketName:
+    Description: Static Website Bucket
+    Value:
+      Ref: WebsiteBucket
